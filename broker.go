@@ -6,10 +6,7 @@ import (
     "github.com/garyburd/redigo/redis"
     "time"
     "encoding/json"
-    "crypto/sha256"
     "bytes"
-    "encoding/binary"
-    "encoding/hex"
     "sync"
     "strings"
     "strconv"
@@ -31,40 +28,43 @@ const RABBITMQSENDSWITCH        = "BrokerSendSwitch"
 const RABBITMQCALLBACKQUEUE     = "BrokerReadQueue"
 const TASKHANDLERTIMEOUT        = 20 * time.Minute
 
-// 定义来自矿管的数据格式
+// 定义来自矿管的数据格式，将原封不动的下发给矿机
 type Task struct {
-    UserId         	int64        `json:"user_id"`
-    Action          string       `json:"action"`
-    Parameter       string       `json:"parameter"`
-    Maclist         []string     `json:"maclist"`
+    TaskId          string        `json:"taskid"`
+    UserId         	int64         `json:"user_id"`
+    Action          string        `json:"action"`
+    Parameter       string        `json:"parameter"`
+    Maclist         []string      `json:"maclist"`
+}
+
+// 矿机完成任务的时间
+type MachineTime struct {
+    Mac             string        `json:"mac"`
+    StartTime       int64         `json:"start_time"`
+    EndTime         int64         `json:"end_time"`
 }
 
 // 定义写入到Redis中的数据格式
 type TaskRedisData struct {
     Task
-    TaskId          string       `json:"taskid"`
-    IsPublished     bool         `json:"is_pub"`
-    MachineNum      int64        `json:"machine_num"`
-    RespMac         []string     `json:"resp_mac"`
-    RespNum         int64        `json:"resp_num"`
-    CompletedMac    []string     `json:"completed_mac"`
-    CompletedNum    int64        `json:"completed_num"`
-    IsFinished      bool         `json:"is_finished"`
-    SuccessMac      []string     `json:"success_mac"`       // 成功完成任务的MAC
-    SuccessNum      int64        `json:"success_num"`       // 成功完成任务的MAC个数
-    FailedMac       []string     `json:"failed_mac"`        // 完成失败任务的MAC
-    FailedNum       int64        `json:"failed_num"`        // 完成失败任务的MAC个数
-    StartTime       int64        `json:"start_time"`
-    EndTime         int64        `json:"end_time"`
-    IsAbort         bool         `json:"is_abort"`
-    AbortType       string       `json:"abort_type"`
+    MachineTime     []MachineTime `json:"machine_time"`
+    IsPublished     bool          `json:"is_pub"`
+    MachineNum      int64         `json:"machine_num"`
+    RespMac         []string      `json:"resp_mac"`
+    RespNum         int64         `json:"resp_num"`
+    CompletedMac    []string      `json:"completed_mac"`
+    CompletedNum    int64         `json:"completed_num"`
+    IsFinished      bool          `json:"is_finished"`
+    SuccessMac      []string      `json:"success_mac"`       // 成功完成任务的MAC
+    SuccessNum      int64         `json:"success_num"`       // 成功完成任务的MAC个数
+    FailedMac       []string      `json:"failed_mac"`        // 完成失败任务的MAC
+    FailedNum       int64         `json:"failed_num"`        // 完成失败任务的MAC个数
+    StartTime       int64         `json:"start_time"`
+    EndTime         int64         `json:"end_time"`
+    IsAbort         bool          `json:"is_abort"`
+    AbortType       string        `json:"abort_type"`
 }
 
-// 定义写入到RabbitMQ中的数据格式
-type TaskRabbitMQData struct {
-    Task
-    TaskId          string       `json:"taskid"`
-}
 
 // 定义矿机执行操作的结果
 type Result struct {
@@ -101,15 +101,15 @@ func PrintfOnError(err error, msg string) {
 }
 
 // 将int64类型转换为[]byte类型
-func IntToByte(num int64) ([]byte, error) {
-    var buffer bytes.Buffer
-    err := binary.Write(&buffer, binary.BigEndian, num)
-    if err != nil {
-        return nil, err
-    }
-
-    return buffer.Bytes(), nil
-}
+//func IntToByte(num int64) ([]byte, error) {
+//    var buffer bytes.Buffer
+//    err := binary.Write(&buffer, binary.BigEndian, num)
+//    if err != nil {
+//        return nil, err
+//    }
+//
+//    return buffer.Bytes(), nil
+//}
 
 // 将bytes类型转换为string
 func BytesToString(b *[]byte) *string {
@@ -140,19 +140,7 @@ func TaskHandler(taskData []byte) {
         return
     }
 
-    // 为该任务生成ID
-    now, err := IntToByte(time.Now().Unix())
-    if err != nil {
-        PrintfOnError(err, "int to byte failed")
-        return
-    }
-
-    sha := sha256.New()
-    sha.Write(append(taskData, now...))
-    taskId := string(hex.EncodeToString(sha.Sum(nil)[:4]))
-
-    // 填充写入到RabbitMQ中的数据
-    taskRabbitMQData := TaskRabbitMQData{task, taskId}
+    taskId := task.TaskId
 
     // 打开Channel并将填充的数据发送到RabbitMQ中
     ch, err := AMQPConn.Channel()
@@ -175,12 +163,6 @@ func TaskHandler(taskData []byte) {
         return
     }
 
-    jsonTaskRabbitData, err := json.Marshal(taskRabbitMQData)
-    if err != nil {
-       PrintfOnError(err, "jsonTaskRabbitData marshaling failed")
-       return
-    }
-
     //callbackQueue := RABBITMQCALLBACKQUEUE + strings.ToUpper(taskId)
     err = ch.Publish(
        RABBITMQSENDSWITCH,
@@ -188,9 +170,9 @@ func TaskHandler(taskData []byte) {
        false,
        false,
        amqp.Publishing{
-           ContentType:"text/plain",                   // 文本格式
+           ContentType:"text/plain",                     // 文本格式
            //ReplyTo:callbackQueue,                      // 接收矿机应答的队列
-           Body:jsonTaskRabbitData,                    // 内容
+           Body:taskData,                                // 内容
        })
 
     if err != nil {
@@ -204,7 +186,7 @@ func TaskHandler(taskData []byte) {
     // 填充写入到Redis中的数据
     taskRedisData := TaskRedisData{
         Task: task,
-        TaskId:taskId,
+        MachineTime: []MachineTime{},
         IsPublished:true,
         MachineNum:int64(len(task.Maclist)),
         RespMac:[]string{},
@@ -262,7 +244,7 @@ func TaskHandler(taskData []byte) {
 
         for msg := range msgs {
             msgStr := BytesToString(&(msg.Body))
-            log.Println("receive a response: ", *msgStr)
+            log.Println("[x] receive a response: ", *msgStr)
 
             var machineData MachineBackData
             if err := json.Unmarshal(msg.Body, &machineData); err != nil {
@@ -286,6 +268,20 @@ func TaskHandler(taskData []byte) {
                 taskRedisData.RespMac = append(taskRedisData.RespMac, mac)
                 taskRedisData.RespNum = int64(len(taskRedisData.RespMac))
 
+                // 将矿机开始执行任务的时间记录下来
+                isExist := false
+                for _, mt := range taskRedisData.MachineTime {
+                    if mac == mt.Mac {
+                        isExist = true
+                        break
+                    }
+                }
+
+                if !isExist {
+                    machineTime := MachineTime{Mac:mac, StartTime:time.Now().Unix()}
+                    taskRedisData.MachineTime = append(taskRedisData.MachineTime, machineTime)
+                }
+
                 // 将填充的数据写入到Redis中
                 jsonTaskRedisData, err := json.Marshal(taskRedisData)
                 if err != nil {
@@ -303,6 +299,14 @@ func TaskHandler(taskData []byte) {
 
                 taskRedisData.CompletedMac = append(taskRedisData.CompletedMac, mac)
                 taskRedisData.CompletedNum = int64(len(taskRedisData.CompletedMac))
+
+                // 将矿机完成执行任务的时间记录下来
+                for idx, mt := range taskRedisData.MachineTime {
+                    if mac == mt.Mac {
+                        taskRedisData.MachineTime[idx].EndTime = time.Now().Unix()
+                        break
+                    }
+                }
 
                 if taskRedisData.CompletedNum == taskRedisData.MachineNum {
                     taskRedisData.IsFinished = true
@@ -348,6 +352,7 @@ func TaskHandler(taskData []byte) {
             PrintfOnError(nil, "Task handler timeout, goroutine exit")
             taskRedisData.IsAbort = true
             taskRedisData.AbortType = "timeout"
+            taskRedisData.EndTime = time.Now().Unix()
 
             // 将填充的数据写入到Redis中
             jsonTaskRedisData, err := json.Marshal(taskRedisData)
@@ -427,7 +432,7 @@ func main() {
 
         // 来自矿管JSON数据格式： {"user_id": "", "action": "","parameter": {}, "maclist": []}
         taskData := redisListRead[1]
-        log.Printf("receive new task: %s", string(taskData))
+        log.Printf("[x] receive new task: %s", string(taskData))
 
         go TaskHandler(taskData)
     }
