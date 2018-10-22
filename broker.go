@@ -10,7 +10,8 @@ import (
     "sync"
     "strings"
     "strconv"
-    )
+    "flag"
+)
 
 var (
     RedisPool       *redis.Pool
@@ -18,6 +19,9 @@ var (
     RCMutex         sync.Mutex
     AMQPConn        *amqp.Connection
     AMQPChannel     *amqp.Channel
+
+    RedisServer   = flag.String("redisServer", "47.106.253.159:6379", "")
+    RedisPassword = flag.String("redisPassword", "sjdtwigkvsmdsjfkgiw23usfvmkj2", "")
 )
 
 const REDISDB                   = 3
@@ -127,6 +131,38 @@ func IsSliceExist(s string, slice []string) bool {
     }
 
     return false
+}
+
+//初始化一个redis pool
+func newRedisPool(server, password string) *redis.Pool {
+    return &redis.Pool{
+        MaxIdle:     3,
+        MaxActive:   5,
+        IdleTimeout: 240 * time.Second,
+        Dial: func() (redis.Conn, error) {
+            c, err := redis.Dial("tcp", server)
+            FatalOnError(err, "Failed to connect to Redis")
+
+            if _, err := c.Do("AUTH", password); err != nil {
+                c.Close()
+                return nil, err
+            }
+
+            if _, err = c.Do("SELECT", REDISDB); err != nil {
+                c.Close()
+                return nil, err
+            }
+
+            return c, err
+        },
+        TestOnBorrow: func(c redis.Conn, t time.Time) error {
+            if time.Since(t) < time.Minute {
+                return nil
+            }
+            _, err := c.Do("PING")
+            return err
+        },
+    }
 }
 
 
@@ -383,27 +419,10 @@ func main() {
     FatalOnError(err, "Failed to open a channel")
     defer AMQPChannel.Close()
 
-    RedisPool = &redis.Pool{
-        MaxIdle: 1,
-        MaxActive: 10,
-        IdleTimeout: 180 * time.Second,
-        Dial: func() (redis.Conn, error) {
-            conn, err := redis.Dial("tcp", "47.106.253.159:6379")
-            FatalOnError(err, "Failed to connect to Redis")
+    flag.Parse()
 
-            if _, err = conn.Do("AUTH", "sjdtwigkvsmdsjfkgiw23usfvmkj2"); err != nil {
-                conn.Close()
-                return nil, err
-            }
-
-            if _, err = conn.Do("SELECT", REDISDB); err != nil {
-                conn.Close()
-                return nil, err
-            }
-
-            return conn, nil
-        },
-    }
+RedisReconnect:
+    RedisPool = newRedisPool(*RedisServer, *RedisPassword)
     defer RedisPool.Close()
 
     RC = RedisPool.Get()        // 从Redis矿池中获取一个连接
@@ -419,18 +438,23 @@ func main() {
         RCMutex.Lock()
         reply, err := RC.Do("BRPOP", REDISTASKQUEUE, 1)
         RCMutex.Unlock()
-        if err != nil || reply == nil {
+        if reply == nil {
             //PrintfOnError(err, "brpop redis hash failed, continue")
             continue
         }
 
+        if err != nil {
+            PrintfOnError(err, "brpop redis hash failed, reconnect redis")
+            goto RedisReconnect
+        }
+
         redisListRead, err := redis.ByteSlices(reply, err)
         if err != nil {
-            PrintfOnError(err, "reply to byteslice failed, continue")
+            PrintfOnError(err, "reply to byte slice failed, continue")
             continue
         }
 
-        // 来自矿管JSON数据格式： {"user_id": "", "action": "","parameter": {}, "maclist": []}
+        // 来自矿管JSON数据格式： {"taskid": "", "user_id": "", "action": "","parameter": "{}", "maclist": []}
         taskData := redisListRead[1]
         log.Printf("[x] receive new task: %s", string(taskData))
 
