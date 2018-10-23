@@ -9,12 +9,12 @@ import (
     "bytes"
     "sync"
     "strings"
-    "strconv"
-    "flag"
+        "flag"
     "path/filepath"
     "os"
     "go.uber.org/zap"
     "fmt"
+    "strconv"
 )
 
 var (
@@ -281,21 +281,53 @@ func TaskHandler(taskData []byte) {
 
 
     for {
-        msgs, err := ch.Consume(readQueue.Name,
-            "",
-            true,
-            false,
-            false,
-            false,
-            nil)
-        if err != nil {
-            PrintfOnError(err, "Receive machine response failed")
-            continue
-        }
+        //msgs, err := ch.Consume(readQueue.Name,
+        //    "",
+        //    true,
+        //    false,
+        //    false,
+        //    false,
+        //    nil)
+        //if err != nil {
+        //    PrintfOnError(err, "Receive machine response failed")
+        //    continue
+        //}
+        select {
+        case <-tm.C:    // 超时检查
+            {
+                PrintfOnError(nil, "Task handler timeout, goroutine exit")
+                taskRedisData.IsAbort = true
+                taskRedisData.AbortType = "timeout"
+                taskRedisData.EndTime = time.Now().Unix()
 
-        for msg := range msgs {
+                // 将填充的数据写入到Redis中
+                jsonTaskRedisData, err := json.Marshal(taskRedisData)
+                if err != nil {
+                    PrintfOnError(err, "jsonTaskRedisData marshaling failed")
+                    return
+                }
+                RCMutex.Lock()
+                RC.Do("HSET", REDISHASH, taskId, string(jsonTaskRedisData))
+                RCMutex.Unlock()
+                return
+            }
+        default:
+            msg, ok, err := ch.Get(readQueue.Name, true)
+            if err != nil {
+                PrintfOnError(err, "Receive machine response failed")
+                continue
+            }
+
+            if !ok {
+                //PrintfOnError(nil, "Receive machine response not ok")
+                time.Sleep(10 * time.Second)
+                continue
+            }
+
+            //PrintfOnError(nil, string(msg.Body))
+            
             msgStr := BytesToString(&(msg.Body))
-            message := fmt.Sprintf("[x] receive a response: %s", *msgStr)
+            message := fmt.Sprintf("[y] receive a response: %s", *msgStr)
             Logger.Info(message)
 
             var machineData MachineBackData
@@ -396,29 +428,6 @@ func TaskHandler(taskData []byte) {
                 PrintfOnError(nil, "response type is wrong")
                 continue
             }
-        }
-
-        select {
-        case <-tm.C:    // 超时TASKHANDLERTIMEOUT Second
-        {
-            PrintfOnError(nil, "Task handler timeout, goroutine exit")
-            taskRedisData.IsAbort = true
-            taskRedisData.AbortType = "timeout"
-            taskRedisData.EndTime = time.Now().Unix()
-
-            // 将填充的数据写入到Redis中
-            jsonTaskRedisData, err := json.Marshal(taskRedisData)
-            if err != nil {
-                PrintfOnError(err, "jsonTaskRedisData marshaling failed")
-                return
-            }
-            RCMutex.Lock()
-            RC.Do("HSET", REDISHASH, taskId, string(jsonTaskRedisData))
-            RCMutex.Unlock()
-            return
-        }
-        default:
-            continue
         }
     }
 }
