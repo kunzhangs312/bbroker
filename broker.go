@@ -11,6 +11,10 @@ import (
     "strings"
     "strconv"
     "flag"
+    "path/filepath"
+    "os"
+    "go.uber.org/zap"
+    "fmt"
 )
 
 var (
@@ -19,9 +23,11 @@ var (
     RCMutex         sync.Mutex
     AMQPConn        *amqp.Connection
     AMQPChannel     *amqp.Channel
+    Logger          *zap.Logger
 
-    RedisServer   = flag.String("redisServer", "47.106.253.159:6379", "")
-    RedisPassword = flag.String("redisPassword", "sjdtwigkvsmdsjfkgiw23usfvmkj2", "")
+    RedisServer    = flag.String("redisServer", "47.106.253.159:6379", "")
+    RedisPassword  = flag.String("redisPassword", "sjdtwigkvsmdsjfkgiw23usfvmkj2", "")
+    RabbitMQServer = flag.String("rabbitmqserver", "amqp://admin:aa0987aa1234@47.106.253.159:5672/", "")
 )
 
 const REDISDB                   = 3
@@ -30,7 +36,8 @@ const REDISTASKQUEUE            = "userOperateTasks"
 const RABBITMQSENDSWITCH        = "BrokerSendSwitch"
 //const RABBITMQRECVSWITCH        = "BrokerRecvSwitch"
 const RABBITMQCALLBACKQUEUE     = "BrokerReadQueue"
-const TASKHANDLERTIMEOUT        = 20 * time.Minute
+const REBOOTTASKHANDLERTIMEOUT  = 10 * time.Minute
+const OTHERTASKHANDLERTIMEOUT   = 5  * time.Minute
 
 // 定义来自矿管的数据格式，将原封不动的下发给矿机
 type Task struct {
@@ -91,16 +98,18 @@ type MachineBackData struct {
 // 致命报错处理
 func FatalOnError(err error, msg string) {
     if err != nil {
-        log.Fatalf("%s: %s", msg, err)
+        message := fmt.Sprintf("%s: %v", msg, err)
+        Logger.Fatal(message)
     }
 }
 
 // 常规报错处理
 func PrintfOnError(err error, msg string) {
     if err != nil {
-        log.Printf("%s: %s", msg, err)
+        message := fmt.Sprintf("%s: %v", msg, err)
+        Logger.Warn(message)
     } else {
-        log.Printf("%s", msg)
+        Logger.Info(msg)
     }
 }
 
@@ -263,7 +272,13 @@ func TaskHandler(taskData []byte) {
         return
     }
 
-    tm := time.NewTimer(TASKHANDLERTIMEOUT)
+    var tm *time.Timer
+    if task.Action == "Restart" {
+        tm = time.NewTimer(REBOOTTASKHANDLERTIMEOUT)
+    } else {
+        tm = time.NewTimer(OTHERTASKHANDLERTIMEOUT)
+    }
+
 
     for {
         msgs, err := ch.Consume(readQueue.Name,
@@ -280,7 +295,8 @@ func TaskHandler(taskData []byte) {
 
         for msg := range msgs {
             msgStr := BytesToString(&(msg.Body))
-            log.Println("[x] receive a response: ", *msgStr)
+            message := fmt.Sprintf("[x] receive a response: %s", *msgStr)
+            Logger.Info(message)
 
             var machineData MachineBackData
             if err := json.Unmarshal(msg.Body, &machineData); err != nil {
@@ -409,9 +425,28 @@ func TaskHandler(taskData []byte) {
 
 
 func main() {
+    dir, err := filepath.Abs(filepath.Dir(os.Args[0]))
+    if err != nil {
+        log.Fatalf("Can't get program's absolute path: %v", err)
+    }
+
+    LogOutputPath := dir + "/" + "broker-output.log"
+    LogErrorOutputPath := dir + "/" + "broker-error.log"
+    zapConfig := zap.NewDevelopmentConfig()
+    zapConfig.OutputPaths = []string{"stdout", LogOutputPath}
+    zapConfig.ErrorOutputPaths = []string{"stderr", LogErrorOutputPath}
+    Logger, err = zapConfig.Build()
+    if err != nil {
+       log.Fatalf("can't initialize zap logger: %v", err)
+    }
+    defer Logger.Sync()
+
+    Logger.Info("blockos manager broker starting...")
+
+
     // 连接RabbitMQ和Redis
-    var err error
-    AMQPConn, err = amqp.Dial("amqp://guest:guest@localhost:5672/")
+    //AMQPConn, err = amqp.Dial("amqp://guest:guest@localhost:5672/")
+    AMQPConn, err = amqp.Dial(*RabbitMQServer)
     FatalOnError(err, "Failed to connect to RabbitMQ")
     defer AMQPConn.Close()
 
@@ -428,9 +463,7 @@ RedisReconnect:
     RC = RedisPool.Get()        // 从Redis矿池中获取一个连接
     defer RC.Close()            // 用完后将连接放回连接池
 
-
-    log.Println("start receive task from redis queue ...")
-
+    Logger.Info("start receive task from redis queue ...")
 
     for {
         // hset对redis进行写操作时，只能对一个hash表有一个写操作，不能同时多个写操作。否则会报
@@ -456,7 +489,8 @@ RedisReconnect:
 
         // 来自矿管JSON数据格式： {"taskid": "", "user_id": "", "action": "","parameter": "{}", "maclist": []}
         taskData := redisListRead[1]
-        log.Printf("[x] receive new task: %s", string(taskData))
+        message := fmt.Sprintf("[x] receive new task: %s", string(taskData))
+        Logger.Info(message)
 
         go TaskHandler(taskData)
     }
