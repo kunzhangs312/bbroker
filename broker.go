@@ -533,7 +533,7 @@ func main() {
 
        if err != nil {
            PrintfOnError(err, "brpop redis hash failed, reconnect redis")
-           goto RedisReconnect
+           continue
        }
 
        redisListRead, err := redis.ByteSlices(reply, err)
