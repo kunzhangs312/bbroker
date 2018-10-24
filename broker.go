@@ -9,13 +9,13 @@ import (
     "bytes"
     "sync"
     "strings"
-        "flag"
+    "flag"
     "path/filepath"
     "os"
     "go.uber.org/zap"
     "fmt"
     "strconv"
-)
+    )
 
 var (
     RedisPool       *redis.Pool
@@ -174,6 +174,48 @@ func newRedisPool(server, password string) *redis.Pool {
     }
 }
 
+// Redis重连
+func reconnectRedis() {
+    if RC != nil {
+        RC.Close()
+    }
+
+    if RedisPool != nil {
+        RedisPool.Close()
+    }
+
+    RedisPool = newRedisPool(*RedisServer, *RedisPassword)
+    RC = RedisPool.Get()        // 从Redis矿池中获取一个连接
+}
+
+// Redis连接检查与重连
+func redisConnPing() {
+    ticker := time.NewTicker(time.Minute)
+    for {
+        select {
+        case <-ticker.C:
+            reply, _ := redis.DoWithTimeout(RC, time.Minute, "PING")
+            if reply == nil {
+                Logger.Warn("Redis disconnect. Try reconnect!")
+                reconnectRedis()
+            }
+        }
+    }
+}
+
+// Redis HSET 操作
+func redisHsetDo(commandName string, args ...interface{}) (reply interface{}, err error) {
+    for {
+        RCMutex.Lock()
+        _, err = redis.DoWithTimeout(RC, 30 * time.Second, commandName, args...)
+        if err != nil {
+            PrintfOnError(err, "Redis Do operate failed")
+            reconnectRedis()
+        }
+        RCMutex.Unlock()
+    }
+}
+
 
 // 处理任务的协程，该协程收到任务后，为任务生成唯一的ID，并将该数据发送到RabbitMQ交换机中，
 // 当消费者接收到来自RabbitMQ的数据后，比对自己的MAC地址是否在数据中，如果在则接收任务并处理，
@@ -251,10 +293,10 @@ func TaskHandler(taskData []byte) {
         PrintfOnError(err, "jsonTaskRedisData marshaling failed")
         return
     }
-    RCMutex.Lock()
-    RC.Do("HSET", REDISHASH, taskId, string(jsonTaskRedisData))
-    RCMutex.Unlock()
-
+    //RCMutex.Lock()
+    //RC.Do("HSET", REDISHASH, taskId, string(jsonTaskRedisData))
+    //RCMutex.Unlock()
+    redisHsetDo("HSET", REDISHASH, taskId, string(jsonTaskRedisData))
 
     // 将任务发送给矿机后，等待矿机完成任务并上报完成的结果
 
@@ -295,7 +337,8 @@ func TaskHandler(taskData []byte) {
         select {
         case <-tm.C:    // 超时检查
             {
-                PrintfOnError(nil, "Task handler timeout, goroutine exit")
+                PrintfOnError(nil, "userid: " + strconv.FormatInt(taskRedisData.UserId,10) +
+                    " taskid: " + taskId + " has timeout, goroutine exit")
                 taskRedisData.IsAbort = true
                 taskRedisData.AbortType = "timeout"
                 taskRedisData.EndTime = time.Now().Unix()
@@ -306,9 +349,10 @@ func TaskHandler(taskData []byte) {
                     PrintfOnError(err, "jsonTaskRedisData marshaling failed")
                     return
                 }
-                RCMutex.Lock()
-                RC.Do("HSET", REDISHASH, taskId, string(jsonTaskRedisData))
-                RCMutex.Unlock()
+                //RCMutex.Lock()
+                //RC.Do("HSET", REDISHASH, taskId, string(jsonTaskRedisData))
+                redisHsetDo("HSET", REDISHASH, taskId, string(jsonTaskRedisData))
+                //RCMutex.Unlock()
                 return
             }
         default:
@@ -325,7 +369,7 @@ func TaskHandler(taskData []byte) {
             }
 
             //PrintfOnError(nil, string(msg.Body))
-            
+
             msgStr := BytesToString(&(msg.Body))
             message := fmt.Sprintf("[y] receive a response: %s", *msgStr)
             Logger.Info(message)
@@ -372,9 +416,10 @@ func TaskHandler(taskData []byte) {
                     PrintfOnError(err, "jsonTaskRedisData marshaling failed")
                     continue
                 }
-                RCMutex.Lock()
-                RC.Do("HSET", REDISHASH, taskId, string(jsonTaskRedisData))
-                RCMutex.Unlock()
+                //RCMutex.Lock()
+                //RC.Do("HSET", REDISHASH, taskId, string(jsonTaskRedisData))
+                //RCMutex.Unlock()
+                redisHsetDo("HSET", REDISHASH, taskId, string(jsonTaskRedisData))
             } else if machineData.RespType == "completed" {
                 if IsSliceExist(mac, taskRedisData.CompletedMac) {
                     PrintfOnError(nil, "Completed Mac has existed")
@@ -415,9 +460,10 @@ func TaskHandler(taskData []byte) {
                     PrintfOnError(err, "jsonTaskRedisData marshaling failed")
                     continue
                 }
-                RCMutex.Lock()
-                RC.Do("HSET", REDISHASH, taskId, string(jsonTaskRedisData))
-                RCMutex.Unlock()
+                //RCMutex.Lock()
+                //RC.Do("HSET", REDISHASH, taskId, string(jsonTaskRedisData))
+                //RCMutex.Unlock()
+                redisHsetDo("HSET", REDISHASH, taskId, string(jsonTaskRedisData))
 
                 if taskRedisData.CompletedNum == taskRedisData.MachineNum {
                     PrintfOnError(nil, "userid: " + strconv.FormatInt(taskRedisData.UserId,10) +
@@ -431,6 +477,8 @@ func TaskHandler(taskData []byte) {
         }
     }
 }
+
+
 
 
 func main() {
@@ -452,7 +500,6 @@ func main() {
 
     Logger.Info("blockos manager broker starting...")
 
-
     // 连接RabbitMQ和Redis
     //AMQPConn, err = amqp.Dial("amqp://guest:guest@localhost:5672/")
     AMQPConn, err = amqp.Dial(*RabbitMQServer)
@@ -465,42 +512,41 @@ func main() {
 
     flag.Parse()
 
-RedisReconnect:
-    RedisPool = newRedisPool(*RedisServer, *RedisPassword)
-    defer RedisPool.Close()
+    // 连接Redis
+    reconnectRedis()
 
-    RC = RedisPool.Get()        // 从Redis矿池中获取一个连接
-    defer RC.Close()            // 用完后将连接放回连接池
+    go redisConnPing()
+
 
     Logger.Info("start receive task from redis queue ...")
 
     for {
-        // hset对redis进行写操作时，只能对一个hash表有一个写操作，不能同时多个写操作。否则会报
-        // use of closed network connection错误。
-        RCMutex.Lock()
-        reply, err := RC.Do("BRPOP", REDISTASKQUEUE, 1)
-        RCMutex.Unlock()
-        if reply == nil {
-            //PrintfOnError(err, "brpop redis hash failed, continue")
-            continue
-        }
+       // hset对redis进行写操作时，只能对一个hash表有一个写操作，不能同时多个写操作。否则会报
+       // use of closed network connection错误。
+       RCMutex.Lock()
+       reply, err := RC.Do("BRPOP", REDISTASKQUEUE, 1)
+       RCMutex.Unlock()
+       if reply == nil {
+           //PrintfOnError(err, "brpop redis hash failed, continue")
+           continue
+       }
 
-        if err != nil {
-            PrintfOnError(err, "brpop redis hash failed, reconnect redis")
-            goto RedisReconnect
-        }
+       if err != nil {
+           PrintfOnError(err, "brpop redis hash failed, reconnect redis")
+           goto RedisReconnect
+       }
 
-        redisListRead, err := redis.ByteSlices(reply, err)
-        if err != nil {
-            PrintfOnError(err, "reply to byte slice failed, continue")
-            continue
-        }
+       redisListRead, err := redis.ByteSlices(reply, err)
+       if err != nil {
+           PrintfOnError(err, "reply to byte slice failed, continue")
+           continue
+       }
 
-        // 来自矿管JSON数据格式： {"taskid": "", "user_id": "", "action": "","parameter": "{}", "maclist": []}
-        taskData := redisListRead[1]
-        message := fmt.Sprintf("[x] receive new task: %s", string(taskData))
-        Logger.Info(message)
+       // 来自矿管JSON数据格式： {"taskid": "", "user_id": "", "action": "","parameter": "{}", "maclist": []}
+       taskData := redisListRead[1]
+       message := fmt.Sprintf("[x] receive new task: %s", string(taskData))
+       Logger.Info(message)
 
-        go TaskHandler(taskData)
+       go TaskHandler(taskData)
     }
 }
